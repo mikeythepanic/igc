@@ -1,0 +1,32 @@
+99283, 99284, 99285, 99291
+
+
+6/20/25
+7pm-8pm -> 10pm-11:47pm
+
+6/23/25 10:45am-2:22pm
+- "provider_references" seem useless
+- slightly different attribute names vs. regency washington data
+this file creates an object tied to the billing code, 
+the billing code object corresponds to an array of objects of negotiated rates,
+this array holds objects of the type "billing class",
+the billing class object holds another (possibly omittable) array of service_codes
+
+an object, that holds an array of objects, that holds an array of objects, that holds an array of objects
+
+plan_id,
+plan_id_type,
+plan_market_type,
+description,
+negotiation_arrangement,
+name,
+billing_code_type,
+billing_code_type_version,
+billing_code,
+negotiated_rate,
+expiration_date
+
+6/25/25 9:10pm-
+- successful extraction and format, trying to figure out why the parsing algorithm is so memory intensive
+- debating on the path to take, optimize the searching algorithm or try to do some web automation. 
+    - I think algorithm
