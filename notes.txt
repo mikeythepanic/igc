@@ -7,7 +7,7 @@
 6/23/25 10:45am-2:22pm
 - "provider_references" seem useless
 - slightly different attribute names vs. regency washington data
-this file creates an object tied to the billing code, 
+this file creates an object tied to the billing code,
 the billing code object corresponds to an array of objects of negotiated rates,
 this array holds objects of the type "billing class",
 the billing class object holds another (possibly omittable) array of service_codes
@@ -26,7 +26,18 @@ billing_code,
 negotiated_rate,
 expiration_date
 
-6/25/25 9:10pm-
+6/25/25 9:10pm-midnight
 - successful extraction and format, trying to figure out why the parsing algorithm is so memory intensive
-- debating on the path to take, optimize the searching algorithm or try to do some web automation. 
+- debating on the path to take, optimize the searching algorithm or try to do some web automation.
     - I think algorithm
+
+
+6/27/25 7pm-10pm
+- did research into web automation vs locally downloading the sheet
+- looked into what i thought were dead links
+    - the reason they dont work is because the links were "time-limited"
+
+6/28/25 2:15pm-4:15pm
+- after learning that service codes and provider references are necessary I tried the first thing in my mind, which was conjoin all of the values into a single cell just formatted with a bar "|"
+- it worked, I don't know how workable it is for actual data analysts but I think it should?
+- now all I need to think about is making the recursive search faster, and messing around with cloud computing, see how fast I can make this program

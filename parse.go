@@ -65,7 +65,7 @@ func findMatchingObjects(data interface{}) []InNetworkObj {
 func main() {
 	fmt.Println("Starting JSON parser...")
 
-	jsonFile, err := os.Open("2024-03-01_W001_in-network-rates.json")
+	jsonFile, err := os.Open("billing_code_matches.json")
 	if err != nil {
 		panic(err)
 	}

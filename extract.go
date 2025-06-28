@@ -12,14 +12,16 @@ import (
 
 // Define the schema structure based on your interpretation
 type NegotiatedPrice struct {
-	BillingClass   string  `json:"billing_class"`
-	ExpirationDate string  `json:"expiration_date"`
-	NegotiatedRate float64 `json:"negotiated_rate"`
-	NegotiatedType string  `json:"negotiated_type"`
+	BillingClass   string   `json:"billing_class"`
+	ExpirationDate string   `json:"expiration_date"`
+	NegotiatedRate float64  `json:"negotiated_rate"`
+	NegotiatedType string   `json:"negotiated_type"`
+	ServiceCode    []string `json:"service_code"`
 }
 
 type NegotiatedRate struct {
-	NegotiatedPrices []NegotiatedPrice `json:"negotiated_prices"`
+	NegotiatedPrices  []NegotiatedPrice `json:"negotiated_prices"`
+	ProviderReference []int64           `json:"provider_references"`
 }
 
 type ICD10Record struct {
@@ -111,6 +113,13 @@ func discoverFields(records []map[string]interface{}) []string {
 	return fields
 }
 
+func handleNullValues(value string) string {
+	if value == "" || value == "<nil>" || value == "null"{
+		return "N/A"
+	}
+	return value
+}
+
 // Extract using the structured approach
 func ExtractToCSV() {
 	fmt.Println("Starting CSV extraction")
@@ -148,6 +157,8 @@ func ExtractToCSV() {
 		"expiration_date",
 		"negotiated_rate",
 		"negotiated_type",
+		"service_code",
+		"provider_references",
 	}
 
 	// Create CSV output file
@@ -174,8 +185,8 @@ func ExtractToCSV() {
 			for _, price := range rate.NegotiatedPrices {
 				row := make([]string, len(csvColumns))
 
-				row[0] = record.BillingCode
-				row[1] = record.BillingCodeType
+				row[0] = handleNullValues(record.BillingCode)
+				row[1] = handleNullValues(record.BillingCodeType)
 				row[2] = record.BillingCodeTypeVersion
 				row[3] = record.Description
 				row[4] = record.Name
@@ -186,6 +197,8 @@ func ExtractToCSV() {
 				row[9] = price.ExpirationDate
 				row[10] = fmt.Sprintf("%.2f", price.NegotiatedRate)
 				row[11] = price.NegotiatedType
+				row[12] = handleNullValues(strings.Join(price.ServiceCode, "|"))
+				row[13] = handleNullValues(strings.Join(strings.Fields(fmt.Sprint(rate.ProviderReference)), "|"))
 
 				if err := writer.Write(row); err != nil {
 					panic(err)
