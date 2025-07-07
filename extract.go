@@ -114,7 +114,7 @@ func discoverFields(records []map[string]interface{}) []string {
 }
 
 func handleNullValues(value string) string {
-	if value == "" || value == "<nil>" || value == "null"{
+	if value == "" || value == "<nil>" || value == "null" {
 		return "N/A"
 	}
 	return value
@@ -143,7 +143,27 @@ func ExtractToCSV() {
 		return
 	}
 
-	// Define CSV columns based on your schema
+	// Find the maximum number of service codes and provider references across all records
+	maxServiceCodes := 0
+	maxProviderRefs := 0
+
+	for _, record := range records {
+		for _, rate := range record.NegotiatedRates {
+			for _, price := range rate.NegotiatedPrices {
+				if len(price.ServiceCode) > maxServiceCodes {
+					maxServiceCodes = len(price.ServiceCode)
+				}
+				if len(rate.ProviderReference) > maxProviderRefs {
+					maxProviderRefs = len(rate.ProviderReference)
+				}
+			}
+		}
+	}
+
+	fmt.Printf("Maximum service codes per record: %d\n", maxServiceCodes)
+	fmt.Printf("Maximum provider references per record: %d\n", maxProviderRefs)
+
+	// Define CSV columns based on your schema with separate columns for arrays
 	csvColumns := []string{
 		"billing_code",
 		"billing_code_type",
@@ -157,8 +177,16 @@ func ExtractToCSV() {
 		"expiration_date",
 		"negotiated_rate",
 		"negotiated_type",
-		"service_code",
-		"provider_references",
+	}
+
+	// Add service code columns
+	for i := 0; i < maxServiceCodes; i++ {
+		csvColumns = append(csvColumns, fmt.Sprintf("service_code_%d", i+1))
+	}
+
+	// Add provider reference columns
+	for i := 0; i < maxProviderRefs; i++ {
+		csvColumns = append(csvColumns, fmt.Sprintf("provider_reference_%d", i+1))
 	}
 
 	// Create CSV output file
@@ -185,6 +213,7 @@ func ExtractToCSV() {
 			for _, price := range rate.NegotiatedPrices {
 				row := make([]string, len(csvColumns))
 
+				// Fill basic fields
 				row[0] = handleNullValues(record.BillingCode)
 				row[1] = handleNullValues(record.BillingCodeType)
 				row[2] = record.BillingCodeTypeVersion
@@ -197,8 +226,30 @@ func ExtractToCSV() {
 				row[9] = price.ExpirationDate
 				row[10] = fmt.Sprintf("%.2f", price.NegotiatedRate)
 				row[11] = price.NegotiatedType
-				row[12] = handleNullValues(strings.Join(price.ServiceCode, "|"))
-				row[13] = handleNullValues(strings.Join(strings.Fields(fmt.Sprint(rate.ProviderReference)), "|"))
+
+				// Fill service code columns
+				serviceCodeStart := 12
+				for j, serviceCode := range price.ServiceCode {
+					if j < maxServiceCodes {
+						row[serviceCodeStart+j] = handleNullValues(serviceCode)
+					}
+				}
+				// Fill remaining service code columns with empty strings
+				for j := len(price.ServiceCode); j < maxServiceCodes; j++ {
+					row[serviceCodeStart+j] = ""
+				}
+
+				// Fill provider reference columns
+				providerRefStart := 12 + maxServiceCodes
+				for j, providerRef := range rate.ProviderReference {
+					if j < maxProviderRefs {
+						row[providerRefStart+j] = handleNullValues(strconv.FormatInt(providerRef, 10))
+					}
+				}
+				// Fill remaining provider reference columns with empty strings
+				for j := len(rate.ProviderReference); j < maxProviderRefs; j++ {
+					row[providerRefStart+j] = ""
+				}
 
 				if err := writer.Write(row); err != nil {
 					panic(err)
