@@ -215,7 +215,7 @@ func main() {
 	fmt.Println("Starting JSON parser with directory processing...")
 
 	// Directory to process
-	dirPath := "../scraper/downloads"
+	dirPath := "../decompress/output"
 	outputFile := "matches.json"
 
 	// Read all files in the directory

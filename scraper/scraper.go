@@ -1,26 +1,19 @@
 package main
 
 import (
-	"encoding/json"
+	"bufio"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
-
-// URLInfo represents a URL found in the JSON
-type URLInfo struct {
-	URL         string
-	Description string
-	PlanID      string
-	PlanName    string
-}
 
 // DownloadResult represents the result of a download
 type DownloadResult struct {
@@ -34,47 +27,114 @@ type DownloadResult struct {
 var httpClient *http.Client
 
 func init() {
-	// Create a reusable HTTP client with optimized settings
+	// Create a highly optimized HTTP client for bulk downloads
 	httpClient = &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 60 * time.Second, // Longer timeout for large files
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  false,
+			MaxIdleConns:          300, // Much higher connection pool
+			MaxIdleConnsPerHost:   100, // More connections per host
+			MaxConnsPerHost:       150, // Higher total connections per host
+			IdleConnTimeout:       120 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			DisableCompression:    false,
+			WriteBufferSize:       64 * 1024, // 64KB write buffer
+			ReadBufferSize:        64 * 1024, // 64KB read buffer
 		},
 	}
 }
 
-func main() {
-	fmt.Println("Starting JSON URL Scraper...")
+func optimalConcurrency() int {
+	cores := runtime.NumCPU()
 
-	// Read the JSON file
-	jsonFile := "../Scraper/2025-07-01_Blue_Cross_and_Blue_Shield_of_Minnesota_index_formatted.json"
-	if len(os.Args) > 1 {
-		jsonFile = os.Args[1]
+	// For your 6C/12T Ryzen 5 5600x, be more aggressive
+	if cores >= 6 {
+		return 80 // High concurrency for your hardware
 	}
 
-	fmt.Printf("Reading JSON file: %s\n", jsonFile)
-	data, err := os.ReadFile(jsonFile)
+	// Fallback for other systems
+	baseConcurrency := cores * 8 // More aggressive multiplier
+
+	min := 20
+	max := 100
+
+	if baseConcurrency < min {
+		return min
+	}
+	if baseConcurrency > max {
+		return max
+	}
+	return baseConcurrency
+}
+
+// loadURLsFromFile reads URLs from a text file (one URL per line)
+func loadURLsFromFile(filename string) ([]string, error) {
+	file, err := os.Open(filename)
 	if err != nil {
-		fmt.Printf("Error reading file: %v\n", err)
+		return nil, err
+	}
+	defer file.Close()
+
+	var urls []string
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Skip empty lines and comments
+		if line != "" && !strings.HasPrefix(line, "#") {
+			// Fix Unicode escapes and check if it's a URL
+			cleanedURL := fixUnicodeEscapes(line)
+			if isURL(cleanedURL) {
+				urls = append(urls, cleanedURL)
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return urls, nil
+}
+
+// fixUnicodeEscapes converts Unicode escapes to actual characters
+func fixUnicodeEscapes(str string) string {
+	// Replace the most common Unicode escapes in URLs
+	str = strings.ReplaceAll(str, "\\u0026", "&")
+	str = strings.ReplaceAll(str, "\\u003d", "=")
+	str = strings.ReplaceAll(str, "\\u003f", "?")
+	str = strings.ReplaceAll(str, "\\u007e", "~")
+	return str
+}
+
+// isURL checks if a string is a valid URL
+func isURL(str string) bool {
+	return strings.HasPrefix(str, "http://") || strings.HasPrefix(str, "https://")
+}
+
+func main() {
+	fmt.Println("Starting URL Downloader...")
+	fmt.Printf("Hardware: %d CPU cores detected\n", runtime.NumCPU())
+
+	// Read URLs from file
+	urlFile := "urls.txt" // Fixed path - file is in same directory
+	if len(os.Args) > 1 {
+		urlFile = os.Args[1]
+	}
+
+	fmt.Printf("Reading URLs from: %s\n", urlFile)
+	urls, err := loadURLsFromFile(urlFile)
+	if err != nil {
+		fmt.Printf("Error reading URL file: %v\n", err)
+		fmt.Println("Usage: ./scraper [urls.txt]")
+		fmt.Println("Create a urls.txt file with one URL per line")
 		os.Exit(1)
 	}
 
-	// Parse JSON
-	var jsonData interface{}
-	if err := json.Unmarshal(data, &jsonData); err != nil {
-		fmt.Printf("Error parsing JSON: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Extract URLs
-	urls := extractURLs(jsonData)
 	fmt.Printf("Found %d URLs to download\n", len(urls))
 
 	if len(urls) == 0 {
-		fmt.Println("No URLs found in the JSON file")
+		fmt.Println("No valid URLs found in the file")
 		return
 	}
 
@@ -89,6 +149,10 @@ func main() {
 	existingFiles := countExistingFiles(downloadDir)
 	fmt.Printf("Found %d existing files in downloads directory\n", existingFiles)
 
+	// Calculate optimal concurrency
+	concurrency := optimalConcurrency()
+	fmt.Printf("Using %d concurrent downloads\n", concurrency)
+
 	// Show initial progress
 	fmt.Printf("Starting download process...\n")
 	fmt.Printf("Progress: 0.0%% (0/%d)\n", len(urls))
@@ -97,8 +161,8 @@ func main() {
 	fmt.Println("Pre-checking existing files...")
 	existingFileMap := buildExistingFileMap(downloadDir)
 
-	// Download files with higher concurrency
-	results := downloadFiles(urls, downloadDir, 20, existingFileMap) // Increased from 5 to 20 concurrent downloads
+	// Download files with optimal concurrency
+	results := downloadFiles(urls, downloadDir, concurrency, existingFileMap)
 
 	// Print summary
 	successCount := 0
@@ -114,66 +178,12 @@ func main() {
 	fmt.Printf("Total URLs: %d\n", len(urls))
 	fmt.Printf("Successful: %d\n", successCount)
 	fmt.Printf("Failed: %d\n", len(urls)-successCount)
+	fmt.Printf("Success Rate: %.1f%%\n", float64(successCount)/float64(len(urls))*100)
 	fmt.Printf("Files saved to: %s/\n", downloadDir)
 }
 
-// extractURLs recursively searches for URLs in the JSON data
-func extractURLs(data interface{}) []URLInfo {
-	var urls []URLInfo
-	extractURLsRecursive(data, "", "", &urls)
-	return urls
-}
-
-// extractURLsRecursive recursively searches for URLs in the JSON data
-func extractURLsRecursive(data interface{}, planID, planName string, urls *[]URLInfo) {
-	switch v := data.(type) {
-	case map[string]interface{}:
-		// Check for URL fields
-		if location, ok := v["location"].(string); ok && isURL(location) {
-			description := ""
-			if desc, ok := v["description"].(string); ok {
-				description = desc
-			}
-			*urls = append(*urls, URLInfo{
-				URL:         location,
-				Description: description,
-				PlanID:      planID,
-				PlanName:    planName,
-			})
-		}
-
-		// Check for plan information
-		if planID == "" {
-			if id, ok := v["plan_id"].(string); ok {
-				planID = id
-			}
-		}
-		if planName == "" {
-			if name, ok := v["plan_name"].(string); ok {
-				planName = name
-			}
-		}
-
-		// Recursively search all values
-		for _, val := range v {
-			extractURLsRecursive(val, planID, planName, urls)
-		}
-
-	case []interface{}:
-		// Recursively search all elements in arrays
-		for _, item := range v {
-			extractURLsRecursive(item, planID, planName, urls)
-		}
-	}
-}
-
-// isURL checks if a string is a valid URL
-func isURL(str string) bool {
-	return strings.HasPrefix(str, "http://") || strings.HasPrefix(str, "https://")
-}
-
 // downloadFiles downloads multiple files concurrently
-func downloadFiles(urls []URLInfo, downloadDir string, concurrency int, existingFileMap map[string]bool) []DownloadResult {
+func downloadFiles(urls []string, downloadDir string, concurrency int, existingFileMap map[string]bool) []DownloadResult {
 	results := make([]DownloadResult, len(urls))
 	semaphore := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
@@ -185,30 +195,45 @@ func downloadFiles(urls []URLInfo, downloadDir string, concurrency int, existing
 	// Progress channel for updates
 	progressChan := make(chan int, total)
 
-	// Progress display goroutine
+	// Batch progress display goroutine (update every 100 downloads for better performance)
 	go func() {
-		for range progressChan {
-			atomic.AddInt32(&completed, 1)
-			current := atomic.LoadInt32(&completed)
-			percentage := float64(current) / float64(total) * 100
-			fmt.Printf("\rProgress: %.1f%% (%d/%d)", percentage, current, total)
+		ticker := time.NewTicker(2 * time.Second) // Update every 2 seconds instead of every download
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-progressChan:
+				atomic.AddInt32(&completed, 1)
+			case <-ticker.C:
+				current := atomic.LoadInt32(&completed)
+				percentage := float64(current) / float64(total) * 100
+				fmt.Printf("\rProgress: %.1f%% (%d/%d)", percentage, current, total)
+			}
+
+			// Check if we're done
+			if atomic.LoadInt32(&completed) >= int32(total) {
+				current := atomic.LoadInt32(&completed)
+				percentage := float64(current) / float64(total) * 100
+				fmt.Printf("\rProgress: %.1f%% (%d/%d)", percentage, current, total)
+				fmt.Println() // New line after final progress
+				return
+			}
 		}
-		fmt.Println() // New line after progress
 	}()
 
-	for i, urlInfo := range urls {
+	for i, urlString := range urls {
 		wg.Add(1)
-		go func(index int, info URLInfo) {
+		go func(index int, url string) {
 			defer wg.Done()
 			semaphore <- struct{}{}        // Acquire semaphore
 			defer func() { <-semaphore }() // Release semaphore
 
-			result := downloadFile(info, downloadDir, existingFileMap)
+			result := downloadFile(url, downloadDir, existingFileMap)
 			results[index] = result
 
 			// Send progress update
 			progressChan <- 1
-		}(i, urlInfo)
+		}(i, urlString)
 	}
 
 	wg.Wait()
@@ -217,12 +242,12 @@ func downloadFiles(urls []URLInfo, downloadDir string, concurrency int, existing
 	return results
 }
 
-// downloadFile downloads a single file
-func downloadFile(urlInfo URLInfo, downloadDir string, existingFileMap map[string]bool) DownloadResult {
-	result := DownloadResult{URL: urlInfo.URL}
+// downloadFile downloads a single file with optimized I/O
+func downloadFile(urlString string, downloadDir string, existingFileMap map[string]bool) DownloadResult {
+	result := DownloadResult{URL: urlString}
 
 	// Create filename from URL
-	parsedURL, err := url.Parse(urlInfo.URL)
+	parsedURL, err := url.Parse(urlString)
 	if err != nil {
 		result.Error = fmt.Errorf("invalid URL: %v", err)
 		return result
@@ -235,30 +260,17 @@ func downloadFile(urlInfo URLInfo, downloadDir string, existingFileMap map[strin
 		filename = "unknown_file"
 	}
 
-	// Create a more descriptive filename
-	descriptiveName := filename
-	if urlInfo.PlanID != "" {
-		descriptiveName = urlInfo.PlanID + "_" + filename
-	}
-	if urlInfo.PlanName != "" {
-		// Clean plan name for filename
-		cleanPlanName := strings.ReplaceAll(urlInfo.PlanName, " ", "_")
-		cleanPlanName = strings.ReplaceAll(cleanPlanName, "/", "_")
-		cleanPlanName = strings.ReplaceAll(cleanPlanName, "\\", "_")
-		descriptiveName = cleanPlanName + "_" + filename
-	}
-
-	filePath := filepath.Join(downloadDir, descriptiveName)
+	filePath := filepath.Join(downloadDir, filename)
 
 	// Check if file already exists using the pre-built map (much faster)
-	if existingFileMap[descriptiveName] {
+	if existingFileMap[filename] {
 		result.Success = true
 		result.FilePath = filePath
 		return result
 	}
 
 	// Download the file using the optimized HTTP client
-	resp, err := httpClient.Get(urlInfo.URL)
+	resp, err := httpClient.Get(urlString)
 	if err != nil {
 		result.Error = fmt.Errorf("HTTP request failed: %v", err)
 		return result
@@ -270,7 +282,7 @@ func downloadFile(urlInfo URLInfo, downloadDir string, existingFileMap map[strin
 		return result
 	}
 
-	// Create the file
+	// Create the file with larger buffer for better I/O performance
 	file, err := os.Create(filePath)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to create file: %v", err)
@@ -278,8 +290,9 @@ func downloadFile(urlInfo URLInfo, downloadDir string, existingFileMap map[strin
 	}
 	defer file.Close()
 
-	// Copy the response body to the file
-	_, err = io.Copy(file, resp.Body)
+	// Use a larger buffer for faster copying (1MB buffer)
+	buffer := make([]byte, 1024*1024)
+	_, err = io.CopyBuffer(file, resp.Body, buffer)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to write file: %v", err)
 		return result
@@ -288,12 +301,6 @@ func downloadFile(urlInfo URLInfo, downloadDir string, existingFileMap map[strin
 	result.Success = true
 	result.FilePath = filePath
 	return result
-}
-
-// fileExists checks if a file exists
-func fileExists(filePath string) bool {
-	_, err := os.Stat(filePath)
-	return err == nil
 }
 
 // countExistingFiles counts the number of files in the downloads directory
