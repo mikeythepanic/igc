@@ -41,3 +41,13 @@ expiration_date
 - after learning that service codes and provider references are necessary I tried the first thing in my mind, which was conjoin all of the values into a single cell just formatted with a bar "|"
 - it worked, I don't know how workable it is for actual data analysts but I think it should?
 - now all I need to think about is making the recursive search faster, and messing around with cloud computing, see how fast I can make this program
+
+7/7/25 9:00-12:30pm 2:00->4
+- fix the delimiter cells
+    - every value has its own cell now 
+- there is only one file in that set of files that has information we need
+- I'm gonna scrape for another file and see what happens
+    - Minnesota statute 62J.812 requires our primary care clinics to post charges and payments for 25 of the most commonly billed procedures, and the average payments or reimbursements received for those services from government and commercial insurance.
+    - this kinda makes minnesota weird, can't find a JSON file for these places, I found one and it didn't involve emergency codes
+
+struggling to find json files, most places I look in minnesota provide csv files instead of json
