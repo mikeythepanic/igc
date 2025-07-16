@@ -12,6 +12,13 @@ import (
 
 // robustDecompress handles corrupted gzip files by reading as much as possible
 func robustDecompress(gzipFile string) error {
+	// Check if already decompressed
+	if isAlreadyDecompressed(gzipFile) {
+		baseFileName := filepath.Base(strings.TrimSuffix(gzipFile, ".gz"))
+		fmt.Printf("⏭ Skipping %s - already decompressed to %s\n", filepath.Base(gzipFile), baseFileName)
+		return nil
+	}
+
 	// Open the gzip file
 	file, err := os.Open(gzipFile)
 	if err != nil {
@@ -98,8 +105,33 @@ func robustDecompress(gzipFile string) error {
 	return nil
 }
 
+// isAlreadyDecompressed checks if a gzip file has already been decompressed
+func isAlreadyDecompressed(gzipFile string) bool {
+	baseFileName := filepath.Base(strings.TrimSuffix(gzipFile, ".gz"))
+	outputFile := filepath.Join("output", baseFileName)
+
+	// Check if output file exists
+	if _, err := os.Stat(outputFile); os.IsNotExist(err) {
+		return false
+	}
+
+	// Check if output file is not empty
+	if info, err := os.Stat(outputFile); err == nil && info.Size() > 0 {
+		return true
+	}
+
+	return false
+}
+
 // simpleDecompress uses the most basic approach possible
 func simpleDecompress(gzipFile string) error {
+	// Check if already decompressed
+	if isAlreadyDecompressed(gzipFile) {
+		baseFileName := filepath.Base(strings.TrimSuffix(gzipFile, ".gz"))
+		fmt.Printf("⏭ Skipping %s - already decompressed to %s\n", filepath.Base(gzipFile), baseFileName)
+		return nil
+	}
+
 	// Open the gzip file
 	file, err := os.Open(gzipFile)
 	if err != nil {
@@ -304,9 +336,16 @@ func main() {
 	successCount := 0
 	errorCount := 0
 	partialCount := 0
+	skippedCount := 0
 
 	for i, gzipFile := range gzipFiles {
 		fmt.Printf("\n[%d/%d] Processing: %s\n", i+1, len(gzipFiles), filepath.Base(gzipFile))
+
+		// Check if already decompressed first
+		if isAlreadyDecompressed(gzipFile) {
+			skippedCount++
+			continue
+		}
 
 		// Try simple decompression first
 		err := simpleDecompress(gzipFile)
@@ -345,6 +384,7 @@ func main() {
 
 	fmt.Printf("\n=== Summary ===\n")
 	fmt.Printf("Total files: %d\n", len(gzipFiles))
+	fmt.Printf("Skipped (already decompressed): %d\n", skippedCount)
 	fmt.Printf("Complete & Valid: %d\n", successCount)
 	fmt.Printf("Partial/Invalid: %d\n", partialCount)
 	fmt.Printf("Failed: %d\n", errorCount)

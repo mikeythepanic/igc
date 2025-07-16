@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
 	"strconv"
 )
 
@@ -44,86 +43,7 @@ type ICD10Record struct {
 	NegotiationArrangment  string           `json:"negotiation_arrangement"`
 }
 
-// Flatten nested object into dot-notation keys
-func flattenObject(obj map[string]interface{}, prefix string) map[string]interface{} {
-	flattened := make(map[string]interface{})
-
-	for key, value := range obj {
-		newKey := key
-		if prefix != "" {
-			newKey = prefix + "." + key
-		}
-
-		switch v := value.(type) {
-		case map[string]interface{}:
-			// Recursively flatten nested objects
-			nested := flattenObject(v, newKey)
-			for nestedKey, nestedValue := range nested {
-				flattened[nestedKey] = nestedValue
-			}
-		case []interface{}:
-			// Handle arrays - store as JSON string
-			if len(v) > 0 {
-				jsonBytes, err := json.Marshal(v)
-				if err != nil {
-					flattened[newKey] = fmt.Sprintf("%v", v)
-				} else {
-					flattened[newKey] = string(jsonBytes)
-				}
-			} else {
-				flattened[newKey] = ""
-			}
-		default:
-			flattened[newKey] = value
-		}
-	}
-
-	return flattened
-}
-
-// Extract value from flattened object using dot notation
-func extractValue(obj map[string]interface{}, path string) string {
-	if val, ok := obj[path]; ok {
-		switch v := val.(type) {
-		case string:
-			return v
-		case float64:
-			return fmt.Sprintf("%.2f", v)
-		case int:
-			return strconv.Itoa(v)
-		case bool:
-			return strconv.FormatBool(v)
-		case nil:
-			return ""
-		default:
-			return fmt.Sprintf("%v", v)
-		}
-	}
-	return ""
-}
-
-// Discover all available fields in the flattened data
-func discoverFields(records []map[string]interface{}) []string {
-	fieldSet := make(map[string]bool)
-
-	for _, record := range records {
-		// Flatten each record first
-		flattened := flattenObject(record, "")
-		for field := range flattened {
-			fieldSet[field] = true
-		}
-	}
-
-	// Convert to slice and sort for consistent ordering
-	fields := make([]string, 0, len(fieldSet))
-	for field := range fieldSet {
-		fields = append(fields, field)
-	}
-	sort.Strings(fields)
-
-	return fields
-}
-
+// handleNullValues replaces empty or null-like strings with "N/A" for cleaner CSV output.
 func handleNullValues(value string) string {
 	if value == "" || value == "<nil>" || value == "null" {
 		return "N/A"
@@ -131,23 +51,38 @@ func handleNullValues(value string) string {
 	return value
 }
 
-// Extract using the structured approach
+// ExtractToCSV reads a .jsonl file containing ICD10 records, flattens them, and writes them to a CSV file.
+// Note: This function loads all records into memory to dynamically determine the number of columns needed in the CSV.
+// For extremely large datasets (many millions of records), this could be memory-intensive.
 func ExtractToCSV() {
-	fmt.Println("Starting CSV extraction")
+	fmt.Println("Starting CSV extraction from .jsonl file")
 
-	// Read the JSON file with matching objects
-	jsonFile, err := os.Open("matches.json")
+	// Read the JSONL file with matching objects.
+	jsonlFile, err := os.Open("matches.jsonl")
 	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("matches.jsonl not found, skipping CSV extraction.")
+			return
+		}
 		panic(err)
 	}
-	defer jsonFile.Close()
+	defer jsonlFile.Close()
 
 	var records []ICD10Record
-	if err := json.NewDecoder(jsonFile).Decode(&records); err != nil {
-		panic(err)
+	decoder := json.NewDecoder(jsonlFile)
+
+	// Read the file stream token by token.
+	for decoder.More() {
+		var record ICD10Record
+		if err := decoder.Decode(&record); err != nil {
+			// This can happen with a malformed JSON object within the stream.
+			fmt.Printf("Warning: could not decode a record: %v. Skipping object.\n", err)
+			continue
+		}
+		records = append(records, record)
 	}
 
-	fmt.Printf("Loaded %d records from matches.json\n", len(records))
+	fmt.Printf("Loaded %d records from matches.jsonl\n", len(records))
 
 	if len(records) == 0 {
 		fmt.Println("No records to process")
