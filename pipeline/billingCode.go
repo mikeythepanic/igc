@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,40 +21,8 @@ var targetCodes = map[string]bool{
 	"99291": true,
 }
 
-// Structured search using the known schema
-func findMatchingObjectsStructured(data interface{}) []map[string]interface{} {
-	var matches []map[string]interface{}
-	var processedCount int64
-
-	// Check if data is an array of records
-	if records, ok := data.([]interface{}); ok {
-		fmt.Printf("Found %d top-level records to process\n", len(records))
-
-		for _, recordInterface := range records {
-			processedCount++
-			if processedCount%1000 == 0 {
-				fmt.Printf("\rSearching... Processed %d records", processedCount)
-			}
-
-			// Try to parse as ICD10Record
-			if recordMap, ok := recordInterface.(map[string]interface{}); ok {
-				if billingCode, exists := recordMap["billing_code"].(string); exists && targetCodes[billingCode] {
-					matches = append(matches, recordMap)
-				}
-			}
-		}
-	} else {
-		// Fallback to recursive search if structure is different
-		fmt.Println("Data is not in expected array format, falling back to recursive search")
-		matches = findMatchingObjectsRecursive(data)
-	}
-
-	fmt.Printf("\nSearch completed. Processed %d total records\n", processedCount)
-	return matches
-}
-
 // findMatchingObjectsRecursive recursively searches for objects with a matching billing_code.
-// It's used as a fallback for JSON files that are not a simple array of records.
+// Used as a fallback for JSON files that are not a simple array of records.
 func findMatchingObjectsRecursive(data interface{}) []map[string]interface{} {
 	var matches []map[string]interface{}
 
@@ -79,68 +48,6 @@ func findMatchingObjectsRecursive(data interface{}) []map[string]interface{} {
 
 	search(data)
 	return matches
-}
-
-func findMatchingObjects(data interface{}) []map[string]interface{} {
-	return findMatchingObjectsStructured(data)
-}
-
-// loadExistingData loads existing records from the output file if it exists
-func loadExistingData(filename string) ([]map[string]interface{}, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// File doesn't exist, return empty slice
-			return []map[string]interface{}{}, nil
-		}
-		return nil, err
-	}
-	defer file.Close()
-
-	// Check if file is empty
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-
-	if fileInfo.Size() == 0 {
-		// File is empty, return empty slice
-		return []map[string]interface{}{}, nil
-	}
-
-	var existingRecords []map[string]interface{}
-	if err := json.NewDecoder(file).Decode(&existingRecords); err != nil {
-		return nil, err
-	}
-
-	return existingRecords, nil
-}
-
-// appendToFile appends new records to the existing file
-func appendToFile(filename string, newRecords []map[string]interface{}) error {
-	// Load existing data
-	existingRecords, err := loadExistingData(filename)
-	if err != nil {
-		return err
-	}
-
-	// Combine existing and new records
-	allRecords := append(existingRecords, newRecords...)
-
-	// Write back to file
-	outputFile, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer outputFile.Close()
-
-	encoder := json.NewEncoder(outputFile)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(allRecords); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // processedFilesLog is the file that tracks processed files
@@ -197,86 +104,265 @@ func saveProcessedFiles(files map[string]bool) error {
 	return encoder.Encode(fileList)
 }
 
-// processFileAndWriteMatches streams a JSON file, finds matches, and writes them directly to the output writer.
-// This avoids loading the entire file into memory and handles JSON files structured as an array of objects.
-func processFileAndWriteMatches(filePath string, writer io.Writer) (int, error) {
-	file, err := os.Open(filePath)
+// StreamingGzipProcessor provides streaming processing of gzip files
+type StreamingGzipProcessor struct {
+	decoder    *json.Decoder
+	gzipReader *gzip.Reader
+	file       *os.File
+}
+
+// NewStreamingGzipProcessor creates a new streaming processor for gzip files
+func NewStreamingGzipProcessor(gzipFilePath string) (*StreamingGzipProcessor, error) {
+	file, err := os.Open(gzipFilePath)
 	if err != nil {
-		return 0, err
+		return nil, fmt.Errorf("failed to open gzip file: %v", err)
 	}
-	defer file.Close()
 
-	// Use a buffered reader to allow peeking at the first characters without consuming them.
-	br := bufio.NewReader(file)
-	var firstChar byte
+	gzipReader, err := gzip.NewReader(file)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to create gzip reader: %v", err)
+	}
 
-	// Loop to skip any leading whitespace and find the first actual character.
+	// Use buffered reader for better performance
+	bufferedReader := bufio.NewReaderSize(gzipReader, 64*1024) // 64KB buffer
+	decoder := json.NewDecoder(bufferedReader)
+
+	return &StreamingGzipProcessor{
+		decoder:    decoder,
+		gzipReader: gzipReader,
+		file:       file,
+	}, nil
+}
+
+// Close closes all resources
+func (sgp *StreamingGzipProcessor) Close() error {
+	var gzipErr, fileErr error
+
+	if sgp.gzipReader != nil {
+		gzipErr = sgp.gzipReader.Close()
+	}
+	if sgp.file != nil {
+		fileErr = sgp.file.Close()
+	}
+
+	if gzipErr != nil {
+		return gzipErr
+	}
+	return fileErr
+}
+
+// ProcessMatches processes the gzip file and writes matching objects to the writer
+func (sgp *StreamingGzipProcessor) ProcessMatches(writer *bufio.Writer) (int, error) {
+	defer sgp.Close()
+
+	// Check if the JSON starts with an array or object
+	firstByte, err := sgp.peekFirstNonWhitespace()
+	if err != nil {
+		return 0, fmt.Errorf("failed to peek first byte: %v", err)
+	}
+
+	matchCount := 0
+
+	if firstByte == '[' {
+		// Process as JSON array
+		matchCount, err = sgp.processArray(writer)
+	} else if firstByte == '{' {
+		// Process as single object or stream of objects
+		matchCount, err = sgp.processObjects(writer)
+	} else {
+		return 0, fmt.Errorf("unexpected JSON structure, starts with: %c", firstByte)
+	}
+
+	return matchCount, err
+}
+
+// peekFirstNonWhitespace looks ahead to find the first non-whitespace character
+func (sgp *StreamingGzipProcessor) peekFirstNonWhitespace() (byte, error) {
+	// Create a new buffered reader to peek without consuming
+	reader := bufio.NewReader(sgp.gzipReader)
+
 	for {
-		b, err := br.ReadByte()
+		b, err := reader.ReadByte()
 		if err != nil {
-			if err == io.EOF {
-				return 0, nil // File is empty, which is not an error.
-			}
 			return 0, err
 		}
 		if !unicode.IsSpace(rune(b)) {
-			firstChar = b
-			break
+			// Put the byte back
+			reader.UnreadByte()
+			// Update our decoder to use this buffered reader
+			sgp.decoder = json.NewDecoder(reader)
+			return b, nil
 		}
 	}
-
-	// Put the character back into the reader stream so the JSON decoder can see it.
-	if err := br.UnreadByte(); err != nil {
-		return 0, err
-	}
-
-	decoder := json.NewDecoder(br)
-	encoder := json.NewEncoder(writer)
-	count := 0
-
-	// Handle file based on whether it's a JSON array or object.
-	if firstChar == '[' {
-		// It's an array. Consume the opening '['.
-		if _, err := decoder.Token(); err != nil {
-			return 0, fmt.Errorf("failed to read opening `[`: %w", err)
-		}
-
-		// Loop through the array elements as long as there are more.
-		for decoder.More() {
-			var record map[string]interface{}
-			if err := decoder.Decode(&record); err != nil {
-				fmt.Printf("\nWarning: could not decode an object in %s: %v. Skipping object.", filepath.Base(filePath), err)
-				continue
-			}
-
-			if billingCode, exists := record["billing_code"].(string); exists && targetCodes[billingCode] {
-				if err := encoder.Encode(record); err != nil {
-					return count, fmt.Errorf("failed to write matched record to output: %w", err)
-				}
-				count++
-			}
-		}
-	} else if firstChar == '{' {
-		// It's a single root object. Decode it all into memory.
-		var data map[string]interface{}
-		if err := decoder.Decode(&data); err != nil {
-			return 0, fmt.Errorf("failed to decode root object: %w", err)
-		}
-
-		// Recursively search the object for matches.
-		matches := findMatchingObjectsRecursive(data)
-		for _, match := range matches {
-			if err := encoder.Encode(match); err != nil {
-				return count, fmt.Errorf("failed to write matched record from object: %w", err)
-			}
-			count++
-		}
-	} else {
-		return 0, fmt.Errorf("file does not appear to be valid JSON (starts with %c)", firstChar)
-	}
-
-	return count, nil
 }
+
+// processArray processes a JSON array structure
+func (sgp *StreamingGzipProcessor) processArray(writer *bufio.Writer) (int, error) {
+	// Consume opening bracket
+	token, err := sgp.decoder.Token()
+	if err != nil {
+		return 0, fmt.Errorf("failed to read opening bracket: %v", err)
+	}
+
+	if delim, ok := token.(json.Delim); !ok || delim != '[' {
+		return 0, fmt.Errorf("expected '[' but got %v", token)
+	}
+
+	matchCount := 0
+	encoder := json.NewEncoder(writer)
+
+	// Process array elements
+	for sgp.decoder.More() {
+		var record map[string]interface{}
+		if err := sgp.decoder.Decode(&record); err != nil {
+			return matchCount, fmt.Errorf("failed to decode record: %v", err)
+		}
+
+		// Check if this record matches our criteria
+		if billingCode, exists := record["billing_code"].(string); exists && targetCodes[billingCode] {
+			if err := encoder.Encode(record); err != nil {
+				return matchCount, fmt.Errorf("failed to write match: %v", err)
+			}
+			matchCount++
+		}
+	}
+
+	return matchCount, nil
+}
+
+// processObjects processes individual JSON objects (single object or stream)
+func (sgp *StreamingGzipProcessor) processObjects(writer *bufio.Writer) (int, error) {
+	matchCount := 0
+	encoder := json.NewEncoder(writer)
+
+	for {
+		var record map[string]interface{}
+		if err := sgp.decoder.Decode(&record); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return matchCount, fmt.Errorf("failed to decode record: %v", err)
+		}
+
+		// Check if this record matches our criteria
+		if billingCode, exists := record["billing_code"].(string); exists && targetCodes[billingCode] {
+			if err := encoder.Encode(record); err != nil {
+				return matchCount, fmt.Errorf("failed to write match: %v", err)
+			}
+			matchCount++
+		} else {
+			// If the object itself isn't a match, search recursively
+			nestedMatches := findMatchingObjectsRecursive(record)
+			for _, match := range nestedMatches {
+				if err := encoder.Encode(match); err != nil {
+					return matchCount, fmt.Errorf("failed to write nested match: %v", err)
+				}
+				matchCount++
+			}
+		}
+	}
+
+	return matchCount, nil
+}
+
+// processJSONFileAndWriteMatches processes regular JSON files (legacy function for non-gzip files) - COMMENTED OUT
+// func processJSONFileAndWriteMatches(filePath string, writer *bufio.Writer) (int, error) {
+// 	file, err := os.Open(filePath)
+// 	if err != nil {
+// 		return 0, err
+// 	}
+// 	defer file.Close()
+//
+// 	// Use a buffered reader to allow peeking at the first characters without consuming them.
+// 	br := bufio.NewReader(file)
+// 	var firstChar byte
+//
+// 	// Loop to skip any leading whitespace and find the first actual character.
+// 	for {
+// 		b, err := br.ReadByte()
+// 		if err != nil {
+// 			if err == io.EOF {
+// 				return 0, nil // File is empty, which is not an error.
+// 			}
+// 			return 0, err
+// 		}
+// 		if !unicode.IsSpace(rune(b)) {
+// 			firstChar = b
+// 			break
+// 		}
+// 	}
+//
+// 	// Put the character back into the reader stream so the JSON decoder can see it.
+// 	if err := br.UnreadByte(); err != nil {
+// 		return 0, err
+// 	}
+//
+// 	decoder := json.NewDecoder(br)
+// 	encoder := json.NewEncoder(writer)
+// 	count := 0
+//
+// 	// Handle file based on whether it's a JSON array or object.
+// 	if firstChar == '[' {
+// 		// It's an array. Consume the opening '['.
+// 		if _, err := decoder.Token(); err != nil {
+// 			return 0, fmt.Errorf("failed to read opening `[`: %w", err)
+// 		}
+//
+// 		// Loop through the array elements as long as there are more.
+// 		for decoder.More() {
+// 			var record map[string]interface{}
+// 			if err := decoder.Decode(&record); err != nil {
+// 				fmt.Printf("\nWarning: could not decode an object in %s: %v. Skipping object.", filepath.Base(filePath), err)
+// 				continue
+// 			}
+//
+// 			if billingCode, exists := record["billing_code"].(string); exists && targetCodes[billingCode] {
+// 				if err := encoder.Encode(record); err != nil {
+// 					return count, fmt.Errorf("failed to write matched record to output: %w", err)
+// 				}
+// 				count++
+// 			}
+// 		}
+// 	} else if firstChar == '{' {
+// 		// The file starts with an object. It could be a single large object,
+// 		// or a stream of objects (JSON Lines format). We'll process it as a stream
+// 		// by decoding objects one by one until we reach the end of the file.
+// 		for {
+// 			var record map[string]interface{}
+// 			if err := decoder.Decode(&record); err != nil {
+// 				if err == io.EOF {
+// 					break // End of file, we're done.
+// 				}
+// 				// If there's an error, we'll stop processing this file.
+// 				fmt.Printf("\nWarning: could not decode an object in %s: %v. File may be malformed.", filepath.Base(filePath), err)
+// 				break
+// 			}
+//
+// 			// We have a single decoded object. Check if it's a match.
+// 			if billingCode, exists := record["billing_code"].(string); exists && targetCodes[billingCode] {
+// 				if err := encoder.Encode(record); err != nil {
+// 					return count, fmt.Errorf("failed to write matched record to output: %w", err)
+// 				}
+// 				count++
+// 			} else {
+// 				// If the object itself isn't a match, it might contain matches within it.
+// 				// This handles cases where records are nested inside a larger structure.
+// 				nestedMatches := findMatchingObjectsRecursive(record)
+// 				for _, match := range nestedMatches {
+// 					if err := encoder.Encode(match); err != nil {
+// 						return count, fmt.Errorf("failed to write matched record from object: %w", err)
+// 					}
+// 					count++
+// 				}
+// 			}
+// 		}
+// 	} else {
+// 		return 0, fmt.Errorf("file does not appear to be valid JSON (starts with %c)", firstChar)
+// 	}
+//
+// 	return count, nil
+// }
 
 // A result struct to pass information back from workers.
 type result struct {
@@ -287,12 +373,37 @@ type result struct {
 
 // worker is the function that will be run concurrently.
 // It reads file paths from the jobs channel, processes them, and sends the result to the results channel.
-func worker(id int, jobs <-chan string, results chan<- result, writer io.Writer, writerMutex *sync.Mutex) {
+func worker(id int, jobs <-chan string, results chan<- result, writer *bufio.Writer, writerMutex *sync.Mutex) {
 	for filePath := range jobs {
 		// Each worker locks the writer before processing a file to ensure that
 		// all writes from a single file are contiguous and not interleaved with other workers.
 		writerMutex.Lock()
-		recordsFound, err := processFileAndWriteMatches(filePath, writer)
+
+		// Process gzip files only (JSON file processing commented out)
+		var recordsFound int
+		var err error
+
+		if strings.HasSuffix(strings.ToLower(filePath), ".gz") {
+			// Process gzip file directly with streaming
+			processor, procErr := NewStreamingGzipProcessor(filePath)
+			if procErr != nil {
+				err = fmt.Errorf("failed to create gzip processor: %v", procErr)
+				recordsFound = 0
+			} else {
+				recordsFound, err = processor.ProcessMatches(writer)
+			}
+		} else {
+			// Process regular JSON file (legacy path) - COMMENTED OUT
+			// recordsFound, err = processJSONFileAndWriteMatches(filePath, writer)
+			err = fmt.Errorf("JSON file processing is disabled - only processing .gz files")
+			recordsFound = 0
+		}
+
+		// Flush the buffer after each file
+		if flushErr := writer.Flush(); flushErr != nil && err == nil {
+			err = fmt.Errorf("failed to flush writer: %v", flushErr)
+		}
+
 		writerMutex.Unlock()
 
 		results <- result{
@@ -304,41 +415,59 @@ func worker(id int, jobs <-chan string, results chan<- result, writer io.Writer,
 }
 
 func main() {
-	fmt.Println("Starting JSON parser with directory processing...")
+	fmt.Println("Starting optimized streaming JSON parser...")
 
-	// Directory to process and the new output file using JSON Lines format
-	dirPath := "../decompress/output"
-	outputFile := "matches.jsonl" // Using .jsonl for streaming
+	// Output file using JSON Lines format
+	outputFile := "matches.jsonl"
 
-	// Read all files in the directory
-	allFiles, err := os.ReadDir(dirPath)
-	if err != nil {
-		panic(err)
-	}
-
-	// Load processed files log to filter out files that have already been processed.
+	// Process both gzip files directly from scraper and decompressed JSON files
+	var filesToProcess []string
 	processedFiles, err := loadProcessedFiles()
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("Loaded %d previously processed files from %s\n", len(processedFiles), processedFilesLog)
 
-	var filesToProcess []string
-	for _, file := range allFiles {
-		fileName := file.Name()
-		if !file.IsDir() && strings.HasSuffix(strings.ToLower(fileName), ".json") {
-			if !processedFiles[fileName] {
-				filesToProcess = append(filesToProcess, filepath.Join(dirPath, fileName))
+	// Process gzip files directly from scraper downloads (preferred)
+	gzipDirPath := "../scraper/downloads"
+	if gzipFiles, err := os.ReadDir(gzipDirPath); err == nil {
+		for _, file := range gzipFiles {
+			fileName := file.Name()
+			if !file.IsDir() && strings.HasSuffix(strings.ToLower(fileName), ".gz") {
+				if !processedFiles[fileName] {
+					filesToProcess = append(filesToProcess, filepath.Join(gzipDirPath, fileName))
+				}
 			}
 		}
+		fmt.Printf("Found %d new gzip files to process directly\n", len(filesToProcess))
+	} else {
+		fmt.Printf("Could not access gzip directory %s: %v\n", gzipDirPath, err)
 	}
+
+	// Also process any decompressed JSON files as fallback (COMMENTED OUT)
+	// initialFileCount := len(filesToProcess)
+	// jsonDirPath := "../decompress/output"
+	// if jsonFiles, err := os.ReadDir(jsonDirPath); err == nil {
+	// 	for _, file := range jsonFiles {
+	// 		fileName := file.Name()
+	// 		if !file.IsDir() && strings.HasSuffix(strings.ToLower(fileName), ".json") {
+	// 			if !processedFiles[fileName] {
+	// 				filesToProcess = append(filesToProcess, filepath.Join(jsonDirPath, fileName))
+	// 			}
+	// 		}
+	// 	}
+	// 	additionalFiles := len(filesToProcess) - initialFileCount
+	// 	fmt.Printf("Found %d additional JSON files to process\n", additionalFiles)
+	// } else {
+	// 	fmt.Printf("Could not access JSON directory %s: %v\n", jsonDirPath, err)
+	// }
 
 	if len(filesToProcess) == 0 {
 		fmt.Println("No new files to process.")
 		return
 	}
 
-	fmt.Printf("Found %d new JSON files to process\n", len(filesToProcess))
+	fmt.Printf("Total files to process: %d\n", len(filesToProcess))
 
 	// --- Concurrency Setup ---
 	// A conservative number of workers: half of the available CPUs, but at least 1.
@@ -359,9 +488,13 @@ func main() {
 	}
 	defer out.Close()
 
+	// Create a buffered writer for better performance
+	bufferedWriter := bufio.NewWriterSize(out, 64*1024) // 64KB buffer
+	defer bufferedWriter.Flush()
+
 	// Start workers.
 	for w := 1; w <= numWorkers; w++ {
-		go worker(w, jobs, results, out, writerMutex)
+		go worker(w, jobs, results, bufferedWriter, writerMutex)
 	}
 
 	// Send jobs to the workers.
@@ -397,9 +530,9 @@ func main() {
 	fmt.Printf("\nProcessing complete!\n")
 	fmt.Printf("Total new records added: %d\n", totalNewRecords)
 	fmt.Printf("Files processed in this run: %d\n", filesProcessed)
-	fmt.Printf("Files skipped (already processed): %d\n", len(allFiles)-len(filesToProcess))
+	fmt.Printf("Files skipped (already processed): %d\n", len(processedFiles))
 
-	// The ExtractToCSV function will need to be updated to handle the .jsonl format.
-	// For now, it is commented out to prevent errors.
+	// Generate CSV output from the .jsonl file
+	fmt.Println("\nGenerating CSV output...")
 	ExtractToCSV()
 }

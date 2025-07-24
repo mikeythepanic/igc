@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"math"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,10 +23,29 @@ type DownloadResult struct {
 	Success  bool
 	Error    error
 	FilePath string
+	Retries  int
+}
+
+// RetryConfig holds configuration for retry logic
+type RetryConfig struct {
+	MaxRetries    int
+	InitialDelay  time.Duration
+	MaxDelay      time.Duration
+	BackoffFactor float64
+	JitterFactor  float64
 }
 
 // Global HTTP client for reuse
 var httpClient *http.Client
+
+// Default retry configuration
+var defaultRetryConfig = RetryConfig{
+	MaxRetries:    3,
+	InitialDelay:  1 * time.Second,
+	MaxDelay:      30 * time.Second,
+	BackoffFactor: 2.0,
+	JitterFactor:  0.1,
+}
 
 func init() {
 	// Create a highly optimized HTTP client for bulk downloads
@@ -44,19 +65,86 @@ func init() {
 	}
 }
 
+// calculateBackoffDelay calculates the delay for the next retry attempt
+func calculateBackoffDelay(attempt int, config RetryConfig) time.Duration {
+	if attempt <= 0 {
+		return config.InitialDelay
+	}
+
+	// Exponential backoff: delay = initial * (factor ^ attempt)
+	delay := float64(config.InitialDelay) * math.Pow(config.BackoffFactor, float64(attempt))
+
+	// Add jitter to prevent thundering herd
+	jitter := delay * config.JitterFactor * (rand.Float64()*2 - 1) // ±jitterFactor
+	delay += jitter
+
+	// Cap at maximum delay
+	if delay > float64(config.MaxDelay) {
+		delay = float64(config.MaxDelay)
+	}
+
+	return time.Duration(delay)
+}
+
+// isRetryableError determines if an error should trigger a retry
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for network-related errors that are typically retryable
+	errStr := err.Error()
+	retryableErrors := []string{
+		"timeout",
+		"connection reset",
+		"connection refused",
+		"temporary failure",
+		"no route to host",
+		"network is unreachable",
+	}
+
+	for _, retryable := range retryableErrors {
+		if strings.Contains(strings.ToLower(errStr), retryable) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isRetryableHTTPStatus determines if an HTTP status code should trigger a retry
+func isRetryableHTTPStatus(statusCode int) bool {
+	retryableStatusCodes := []int{
+		429, // Too Many Requests
+		500, // Internal Server Error
+		502, // Bad Gateway
+		503, // Service Unavailable
+		504, // Gateway Timeout
+	}
+
+	for _, code := range retryableStatusCodes {
+		if statusCode == code {
+			return true
+		}
+	}
+
+	return false
+}
+
 func optimalConcurrency() int {
 	cores := runtime.NumCPU()
 
-	// For your 6C/12T Ryzen 5 5600x, be more aggressive
+	// Use much more conservative settings to avoid 403 errors
+	// The bcbsmn.mrf.bcbs.com server is blocking high concurrency
 	if cores >= 6 {
-		return 80 // High concurrency for your hardware
+		return 10 // Very conservative for server-friendly downloading
 	}
 
-	// Fallback for other systems
-	baseConcurrency := cores * 8 // More aggressive multiplier
+	// Even more conservative fallback for other systems
+	baseConcurrency := 5 // Much lower to respect server limits
 
-	min := 20
-	max := 100
+	min := 5
+	max := 20 // Much lower maximum
 
 	if baseConcurrency < min {
 		return min
@@ -166,11 +254,17 @@ func main() {
 
 	// Print summary
 	successCount := 0
+	retriedCount := 0
+	totalRetries := 0
 	for _, result := range results {
 		if result.Success {
 			successCount++
+			if result.Retries > 0 {
+				retriedCount++
+				totalRetries += result.Retries
+			}
 		} else {
-			fmt.Printf("Failed to download %s: %v\n", result.URL, result.Error)
+			fmt.Printf("Failed to download %s after %d attempts: %v\n", result.URL, result.Retries+1, result.Error)
 		}
 	}
 
@@ -179,6 +273,10 @@ func main() {
 	fmt.Printf("Successful: %d\n", successCount)
 	fmt.Printf("Failed: %d\n", len(urls)-successCount)
 	fmt.Printf("Success Rate: %.1f%%\n", float64(successCount)/float64(len(urls))*100)
+	if retriedCount > 0 {
+		fmt.Printf("Downloads that required retries: %d (%.1f%%)\n", retriedCount, float64(retriedCount)/float64(len(urls))*100)
+		fmt.Printf("Average retries per failed download: %.1f\n", float64(totalRetries)/float64(retriedCount))
+	}
 	fmt.Printf("Files saved to: %s/\n", downloadDir)
 }
 
@@ -228,6 +326,9 @@ func downloadFiles(urls []string, downloadDir string, concurrency int, existingF
 			semaphore <- struct{}{}        // Acquire semaphore
 			defer func() { <-semaphore }() // Release semaphore
 
+			// Add small delay to be more server-friendly
+			time.Sleep(100 * time.Millisecond)
+
 			result := downloadFile(url, downloadDir, existingFileMap)
 			results[index] = result
 
@@ -242,7 +343,7 @@ func downloadFiles(urls []string, downloadDir string, concurrency int, existingF
 	return results
 }
 
-// downloadFile downloads a single file with optimized I/O
+// downloadFile downloads a single file with optimized I/O and retry logic
 func downloadFile(urlString string, downloadDir string, existingFileMap map[string]bool) DownloadResult {
 	result := DownloadResult{URL: urlString}
 
@@ -269,37 +370,77 @@ func downloadFile(urlString string, downloadDir string, existingFileMap map[stri
 		return result
 	}
 
-	// Download the file using the optimized HTTP client
-	resp, err := httpClient.Get(urlString)
-	if err != nil {
-		result.Error = fmt.Errorf("HTTP request failed: %v", err)
+	// Attempt download with retry logic
+	for attempt := 0; attempt <= defaultRetryConfig.MaxRetries; attempt++ {
+		if attempt > 0 {
+			// Calculate and apply backoff delay
+			delay := calculateBackoffDelay(attempt-1, defaultRetryConfig)
+			time.Sleep(delay)
+		}
+
+		// Download the file using the optimized HTTP client
+		resp, err := httpClient.Get(urlString)
+		if err != nil {
+			result.Error = fmt.Errorf("HTTP request failed: %v", err)
+			result.Retries = attempt
+
+			// Check if this is a retryable error and we have retries left
+			if isRetryableError(err) && attempt < defaultRetryConfig.MaxRetries {
+				continue
+			}
+			return result
+		}
+
+		// Check HTTP status code
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			result.Error = fmt.Errorf("HTTP status %d", resp.StatusCode)
+			result.Retries = attempt
+
+			// Check if this is a retryable status and we have retries left
+			if isRetryableHTTPStatus(resp.StatusCode) && attempt < defaultRetryConfig.MaxRetries {
+				continue
+			}
+			return result
+		}
+
+		// Create the file with larger buffer for better I/O performance
+		file, err := os.Create(filePath)
+		if err != nil {
+			resp.Body.Close()
+			result.Error = fmt.Errorf("failed to create file: %v", err)
+			result.Retries = attempt
+			return result
+		}
+
+		// Use a larger buffer for faster copying (1MB buffer)
+		buffer := make([]byte, 1024*1024)
+		_, err = io.CopyBuffer(file, resp.Body, buffer)
+
+		// Close resources
+		resp.Body.Close()
+		file.Close()
+
+		if err != nil {
+			// Remove partially written file
+			os.Remove(filePath)
+			result.Error = fmt.Errorf("failed to write file: %v", err)
+			result.Retries = attempt
+
+			// File writing errors are usually not retryable (disk space, permissions)
+			return result
+		}
+
+		// Success!
+		result.Success = true
+		result.FilePath = filePath
+		result.Retries = attempt
 		return result
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		result.Error = fmt.Errorf("HTTP status %d", resp.StatusCode)
-		return result
-	}
-
-	// Create the file with larger buffer for better I/O performance
-	file, err := os.Create(filePath)
-	if err != nil {
-		result.Error = fmt.Errorf("failed to create file: %v", err)
-		return result
-	}
-	defer file.Close()
-
-	// Use a larger buffer for faster copying (1MB buffer)
-	buffer := make([]byte, 1024*1024)
-	_, err = io.CopyBuffer(file, resp.Body, buffer)
-	if err != nil {
-		result.Error = fmt.Errorf("failed to write file: %v", err)
-		return result
-	}
-
-	result.Success = true
-	result.FilePath = filePath
+	// This should never be reached due to the loop logic, but just in case
+	result.Error = fmt.Errorf("max retries exceeded")
+	result.Retries = defaultRetryConfig.MaxRetries
 	return result
 }
 

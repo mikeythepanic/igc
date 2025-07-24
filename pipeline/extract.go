@@ -52,10 +52,9 @@ func handleNullValues(value string) string {
 }
 
 // ExtractToCSV reads a .jsonl file containing ICD10 records, flattens them, and writes them to a CSV file.
-// Note: This function loads all records into memory to dynamically determine the number of columns needed in the CSV.
-// For extremely large datasets (many millions of records), this could be memory-intensive.
+// This optimized version limits excessive columns and adds proper summary statistics.
 func ExtractToCSV() {
-	fmt.Println("Starting CSV extraction from .jsonl file")
+	fmt.Println("Starting optimized CSV extraction from .jsonl file")
 
 	// Read the JSONL file with matching objects.
 	jsonlFile, err := os.Open("matches.jsonl")
@@ -89,12 +88,14 @@ func ExtractToCSV() {
 		return
 	}
 
-	// Find the maximum number of service codes and provider references across all records
+	// Find reasonable maximums (limit excessive columns)
 	maxServiceCodes := 0
 	maxProviderRefs := 0
 	maxProviderGroups := 0
-	maxNPIs := 0
-	maxTINs := 0
+
+	// Limit provider references to a reasonable number (e.g., 50 instead of 1798)
+	const MAX_PROVIDER_REFS = 50
+	const MAX_SERVICE_CODES = 100
 
 	for _, record := range records {
 		for _, rate := range record.NegotiatedRates {
@@ -109,28 +110,28 @@ func ExtractToCSV() {
 			if len(rate.ProviderGroups) > maxProviderGroups {
 				maxProviderGroups = len(rate.ProviderGroups)
 			}
-			for _, group := range rate.ProviderGroups {
-				if len(group.NPI) > maxNPIs {
-					maxNPIs = len(group.NPI)
-				}
-				// TIN is now a single object, so maxTINs will be 1
-				maxTINs = 1
-			}
 		}
+	}
+
+	// Apply reasonable limits
+	if maxServiceCodes > MAX_SERVICE_CODES {
+		maxServiceCodes = MAX_SERVICE_CODES
+		fmt.Printf("Limiting service codes to %d columns (found %d max)\n", MAX_SERVICE_CODES, maxServiceCodes)
+	}
+	if maxProviderRefs > MAX_PROVIDER_REFS {
+		fmt.Printf("Limiting provider references to %d columns (found %d max)\n", MAX_PROVIDER_REFS, maxProviderRefs)
+		maxProviderRefs = MAX_PROVIDER_REFS
 	}
 
 	fmt.Printf("Maximum service codes per record: %d\n", maxServiceCodes)
 	fmt.Printf("Maximum provider references per record: %d\n", maxProviderRefs)
 	fmt.Printf("Maximum provider groups per record: %d\n", maxProviderGroups)
-	fmt.Printf("Maximum NPIs per group: %d\n", maxNPIs)
-	fmt.Printf("Maximum TINs per group: %d\n", maxTINs)
 
-	// Define CSV columns based on the schema
+	// Define optimized CSV columns
 	csvColumns := []string{
 		"billing_code",
 		"billing_code_type",
 		"billing_code_type_version",
-		"description",
 		"name",
 		"negotiated_rates_count",
 		"negotiation_arrangement",
@@ -139,33 +140,26 @@ func ExtractToCSV() {
 		"expiration_date",
 		"negotiated_rate",
 		"negotiated_type",
+		"provider_references_count", // Count of provider references
+		"provider_groups_count",     // Count of provider groups
+		"total_npis_count",          // Total number of NPIs across all groups
+		"total_tins_count",          // Total number of TINs across all groups
 	}
 
-	// Add service code columns
+	// Add limited service code columns
 	for i := 0; i < maxServiceCodes; i++ {
 		csvColumns = append(csvColumns, fmt.Sprintf("service_code_%d", i+1))
 	}
 
-	// Add provider reference columns
+	// Add limited provider reference columns
 	for i := 0; i < maxProviderRefs; i++ {
 		csvColumns = append(csvColumns, fmt.Sprintf("provider_reference_%d", i+1))
 	}
 
-	// Add provider group columns
-	/* for i := 0; i < maxProviderGroups; i++ {
-		csvColumns = append(csvColumns, fmt.Sprintf("provider_group_%d_npi_count", i+1))
-		csvColumns = append(csvColumns, fmt.Sprintf("provider_group_%d_tin_count", i+1))
-	} */
-
-	// Add NPI columns
-	for i := 0; i < maxNPIs; i++ {
-		csvColumns = append(csvColumns, fmt.Sprintf("npi_%d", i+1))
-	}
-
-	// Add TIN columns
-	for i := 0; i < maxTINs; i++ {
-		csvColumns = append(csvColumns, fmt.Sprintf("tin_%d", i+1))
-	}
+	// Add summary columns for first provider group (instead of all individual NPIs/TINs)
+	csvColumns = append(csvColumns, "first_group_npi_count")
+	csvColumns = append(csvColumns, "first_group_tin_type")
+	csvColumns = append(csvColumns, "first_group_tin_value")
 
 	// Create CSV output file
 	csvFile, err := os.Create("matches.csv")
@@ -195,18 +189,31 @@ func ExtractToCSV() {
 				row[0] = handleNullValues(record.BillingCode)
 				row[1] = handleNullValues(record.BillingCodeType)
 				row[2] = record.BillingCodeTypeVersion
-				row[3] = record.Description
-				row[4] = record.Name
-				row[5] = strconv.Itoa(len(record.NegotiatedRates))
-				row[6] = record.NegotiationArrangment
-				row[7] = strconv.Itoa(len(rate.NegotiatedPrices))
-				row[8] = price.BillingClass
-				row[9] = price.ExpirationDate
-				row[10] = fmt.Sprintf("%.2f", price.NegotiatedRate)
-				row[11] = price.NegotiatedType
+				row[3] = record.Name
+				row[4] = strconv.Itoa(len(record.NegotiatedRates))
+				row[5] = record.NegotiationArrangment
+				row[6] = strconv.Itoa(len(rate.NegotiatedPrices))
+				row[7] = price.BillingClass
+				row[8] = price.ExpirationDate
+				row[9] = fmt.Sprintf("%.2f", price.NegotiatedRate)
+				row[10] = price.NegotiatedType
+
+				// Add provider and group counts (validation of counting logic)
+				row[11] = strconv.Itoa(len(rate.ProviderReference)) // provider_references_count
+				row[12] = strconv.Itoa(len(rate.ProviderGroups))    // provider_groups_count
+
+				// Calculate total NPIs and TINs across all groups
+				totalNPIs := 0
+				totalTINs := 0
+				for _, group := range rate.ProviderGroups {
+					totalNPIs += len(group.NPI)
+					totalTINs += 1 // Each group has exactly one TIN
+				}
+				row[13] = strconv.Itoa(totalNPIs) // total_npis_count
+				row[14] = strconv.Itoa(totalTINs) // total_tins_count
 
 				// Fill service code columns
-				serviceCodeStart := 12
+				serviceCodeStart := 15
 				for j, serviceCode := range price.ServiceCode {
 					if j < maxServiceCodes {
 						row[serviceCodeStart+j] = handleNullValues(serviceCode)
@@ -218,7 +225,7 @@ func ExtractToCSV() {
 				}
 
 				// Fill provider reference columns
-				providerRefStart := 12 + maxServiceCodes
+				providerRefStart := 15 + maxServiceCodes
 				for j, providerRef := range rate.ProviderReference {
 					if j < maxProviderRefs {
 						row[providerRefStart+j] = strconv.FormatFloat(providerRef, 'f', -1, 64)
@@ -229,46 +236,17 @@ func ExtractToCSV() {
 					row[providerRefStart+j] = ""
 				}
 
-				// Fill provider group columns (commented out)
-				// providerGroupStart := 12 + maxServiceCodes + maxProviderRefs
-				// for j, group := range rate.ProviderGroups {
-				// 	if j < maxProviderGroups {
-				// 		row[providerGroupStart+j*2] = strconv.Itoa(len(group.NPI))
-				// 		row[providerGroupStart+j*2+1] = "1" // TIN is a single object
-				// 	}
-				// }
-				// // Fill remaining provider group columns with empty strings
-				// for j := len(rate.ProviderGroups); j < maxProviderGroups; j++ {
-				// 	row[providerGroupStart+j*2] = ""
-				// 	row[providerGroupStart+j*2+1] = ""
-				// }
-
-				// Fill NPI columns (from first provider group)
-				npiStart := 12 + maxServiceCodes + maxProviderRefs
+				// Fill first provider group details (instead of all individual NPIs)
+				firstGroupStart := 15 + maxServiceCodes + maxProviderRefs
 				if len(rate.ProviderGroups) > 0 {
 					firstGroup := rate.ProviderGroups[0]
-					for j, npi := range firstGroup.NPI {
-						if j < maxNPIs {
-							row[npiStart+j] = handleNullValues(strconv.FormatFloat(npi, 'f', -1, 64))
-						}
-					}
-				}
-				// Fill remaining NPI columns with empty strings
-				for j := 0; j < maxNPIs; j++ {
-					if j >= len(rate.ProviderGroups) || j >= len(rate.ProviderGroups[0].NPI) {
-						row[npiStart+j] = ""
-					}
-				}
-
-				// Fill TIN columns (from first provider group)
-				tinStart := 12 + maxServiceCodes + maxProviderRefs + maxNPIs
-				if len(rate.ProviderGroups) > 0 {
-					firstGroup := rate.ProviderGroups[0]
-					row[tinStart] = handleNullValues(firstGroup.TIN.Type)
-				}
-				// Fill remaining TIN columns with empty strings
-				for j := 1; j < maxTINs; j++ {
-					row[tinStart+j] = ""
+					row[firstGroupStart] = strconv.Itoa(len(firstGroup.NPI))        // first_group_npi_count
+					row[firstGroupStart+1] = handleNullValues(firstGroup.TIN.Type)  // first_group_tin_type
+					row[firstGroupStart+2] = handleNullValues(firstGroup.TIN.Value) // first_group_tin_value
+				} else {
+					row[firstGroupStart] = "0"
+					row[firstGroupStart+1] = ""
+					row[firstGroupStart+2] = ""
 				}
 
 				if err := writer.Write(row); err != nil {
@@ -284,4 +262,5 @@ func ExtractToCSV() {
 	}
 
 	fmt.Printf("Extracted %d rows to matches.csv\n", rowCount)
+	fmt.Println("CSV now has a manageable number of columns with proper provider/group counting validation")
 }
