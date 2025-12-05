@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
@@ -317,7 +318,242 @@ func processGzipStream(filename string) error {
 	return nil
 }
 
+// StreamDecompressor provides streaming decompression capabilities
+type StreamDecompressor struct {
+	reader *gzip.Reader
+	file   *os.File
+}
+
+// NewStreamDecompressor creates a new streaming decompressor for a gzip file
+func NewStreamDecompressor(gzipFilePath string) (*StreamDecompressor, error) {
+	file, err := os.Open(gzipFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open gzip file: %v", err)
+	}
+
+	gzipReader, err := gzip.NewReader(file)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to create gzip reader: %v", err)
+	}
+
+	return &StreamDecompressor{
+		reader: gzipReader,
+		file:   file,
+	}, nil
+}
+
+// Read implements io.Reader interface for streaming decompressed data
+func (sd *StreamDecompressor) Read(p []byte) (n int, err error) {
+	return sd.reader.Read(p)
+}
+
+// Close closes the decompressor and underlying file
+func (sd *StreamDecompressor) Close() error {
+	var gzipErr, fileErr error
+
+	if sd.reader != nil {
+		gzipErr = sd.reader.Close()
+	}
+	if sd.file != nil {
+		fileErr = sd.file.Close()
+	}
+
+	// Return the first error encountered
+	if gzipErr != nil {
+		return gzipErr
+	}
+	return fileErr
+}
+
+// StreamingJSONProcessor processes JSON data from a stream without loading everything into memory
+type StreamingJSONProcessor struct {
+	decoder *json.Decoder
+	source  io.ReadCloser
+}
+
+// NewStreamingJSONProcessor creates a new streaming JSON processor
+func NewStreamingJSONProcessor(reader io.ReadCloser) *StreamingJSONProcessor {
+	return &StreamingJSONProcessor{
+		decoder: json.NewDecoder(reader),
+		source:  reader,
+	}
+}
+
+// ProcessTokens processes JSON tokens from the stream and calls the provided function for each complete object
+func (sjp *StreamingJSONProcessor) ProcessTokens(objectHandler func(map[string]interface{}) error) error {
+	defer sjp.source.Close()
+
+	for sjp.decoder.More() {
+		var obj map[string]interface{}
+		if err := sjp.decoder.Decode(&obj); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("failed to decode JSON object: %v", err)
+		}
+
+		if err := objectHandler(obj); err != nil {
+			return fmt.Errorf("object handler error: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// ProcessArray processes a JSON array from the stream
+func (sjp *StreamingJSONProcessor) ProcessArray(objectHandler func(map[string]interface{}) error) error {
+	defer sjp.source.Close()
+
+	// Read opening bracket
+	token, err := sjp.decoder.Token()
+	if err != nil {
+		return fmt.Errorf("failed to read opening token: %v", err)
+	}
+
+	if delim, ok := token.(json.Delim); !ok || delim != '[' {
+		return fmt.Errorf("expected opening '[' but got %v", token)
+	}
+
+	// Process array elements
+	for sjp.decoder.More() {
+		var obj map[string]interface{}
+		if err := sjp.decoder.Decode(&obj); err != nil {
+			return fmt.Errorf("failed to decode array element: %v", err)
+		}
+
+		if err := objectHandler(obj); err != nil {
+			return fmt.Errorf("object handler error: %v", err)
+		}
+	}
+
+	// Read closing bracket
+	token, err = sjp.decoder.Token()
+	if err != nil {
+		return fmt.Errorf("failed to read closing token: %v", err)
+	}
+
+	if delim, ok := token.(json.Delim); !ok || delim != ']' {
+		return fmt.Errorf("expected closing ']' but got %v", token)
+	}
+
+	return nil
+}
+
+// Close closes the processor
+func (sjp *StreamingJSONProcessor) Close() error {
+	return sjp.source.Close()
+}
+
+// CreateJSONStream creates a streaming JSON processor from a gzip file
+func CreateJSONStream(gzipFilePath string) (*StreamingJSONProcessor, error) {
+	decompressor, err := NewStreamDecompressor(gzipFilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewStreamingJSONProcessor(decompressor), nil
+}
+
+// BufferedJSONStream provides a buffered JSON stream for better performance
+type BufferedJSONStream struct {
+	*StreamingJSONProcessor
+	buffer *bufio.Reader
+}
+
+// NewBufferedJSONStream creates a buffered JSON stream from a gzip file
+func NewBufferedJSONStream(gzipFilePath string, bufferSize int) (*BufferedJSONStream, error) {
+	decompressor, err := NewStreamDecompressor(gzipFilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	buffer := bufio.NewReaderSize(decompressor, bufferSize)
+
+	return &BufferedJSONStream{
+		StreamingJSONProcessor: &StreamingJSONProcessor{
+			decoder: json.NewDecoder(buffer),
+			source:  decompressor,
+		},
+		buffer: buffer,
+	}, nil
+}
+
+// StreamingDecompressExample demonstrates the streaming decompression functionality
+func StreamingDecompressExample() {
+	downloadsDir := "../scraper/downloads"
+
+	// Find all .gz files in the directory
+	gzipFiles, err := findGzipFiles(downloadsDir)
+	if err != nil {
+		fmt.Printf("Error scanning directory: %v\n", err)
+		return
+	}
+
+	if len(gzipFiles) == 0 {
+		fmt.Println("No gzip files found for streaming example")
+		return
+	}
+
+	// Take the first file as an example
+	exampleFile := gzipFiles[0]
+	fmt.Printf("Streaming decompression example with: %s\n", filepath.Base(exampleFile))
+
+	// Create a streaming JSON processor
+	stream, err := CreateJSONStream(exampleFile)
+	if err != nil {
+		fmt.Printf("Failed to create JSON stream: %v\n", err)
+		return
+	}
+	defer stream.Close()
+
+	// Count objects as they stream
+	objectCount := 0
+	err = stream.ProcessTokens(func(obj map[string]interface{}) error {
+		objectCount++
+
+		// Print progress every 1000 objects
+		if objectCount%1000 == 0 {
+			fmt.Printf("Streamed %d objects...\n", objectCount)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		fmt.Printf("Streaming error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✅ Successfully streamed %d JSON objects\n", objectCount)
+}
+
 func main() {
+	fmt.Println("=== Decompress Module ===")
+	fmt.Println("Choose mode:")
+	fmt.Println("1. Legacy file-based decompression")
+	fmt.Println("2. Streaming decompression example")
+
+	// For now, default to streaming example
+	// In production, this would be controlled by command-line flags
+	mode := 2
+
+	switch mode {
+	case 1:
+		// Legacy mode - process all gzip files to disk
+		fmt.Println("Running legacy file-based decompression...")
+		legacyDecompression()
+	case 2:
+		// Streaming mode example
+		fmt.Println("Running streaming decompression example...")
+		StreamingDecompressExample()
+	default:
+		fmt.Println("Invalid mode")
+	}
+}
+
+// legacyDecompression is the original main function logic
+func legacyDecompression() {
 	// Process all gzip files in the downloads directory
 	downloadsDir := "../scraper/downloads"
 

@@ -51,3 +51,4 @@ expiration_date
     - this kinda makes minnesota weird, can't find a JSON file for these places, I found one and it didn't involve emergency codes
 
 struggling to find json files, most places I look in minnesota provide csv files instead of json
+

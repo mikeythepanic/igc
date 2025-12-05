@@ -1,4 +1,4 @@
-package jsonformatter
+package main
 
 import (
 	"encoding/json"
